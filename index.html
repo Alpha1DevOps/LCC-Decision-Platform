@@ -194,6 +194,7 @@
       FileText: ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="16" x2="8" y1="13" y2="13" /><line x1="16" x2="8" y1="17" y2="17" /><polyline points="10 9 9 9 8 9" /></svg>,
       Printer: ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 6 2 18 2 18 9" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" /></svg>,
       X: ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>,
+      Maximize: ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" /></svg>,
     };
 
     // -------------------------------------------------------------
@@ -310,12 +311,91 @@
       return 0;
     };
 
-    const analyzeOption = (option, config) => {
+    const calculateIRR = (cashFlows) => {
+      // cashFlows: array of values (undiscounted) ordered by year 0 to N
+      // Newton-Raphson method
+      let guess = 0.1;
+      const maxIter = 50;
+      const precision = 0.00001;
+
+      for (let i = 0; i < maxIter; i++) {
+        let npv = 0;
+        let dNpv = 0;
+        for (let t = 0; t < cashFlows.length; t++) {
+          const val = cashFlows[t];
+          const div = Math.pow(1 + guess, t);
+          npv += val / div;
+          dNpv += -t * val / (div * (1 + guess));
+        }
+
+        if (Math.abs(npv) < precision) return guess * 100;
+        if (Math.abs(dNpv) < 0.0000001) return null; // multiple solutions or flat
+        const newGuess = guess - npv / dNpv;
+        if (Math.abs(newGuess - guess) < precision) return newGuess * 100;
+        guess = newGuess;
+      }
+      return null;
+    };
+
+    const calculatePaybackPeriod = (cashFlows) => {
+      // cashFlows: array of vales (undiscounted)
+      let cumulative = 0;
+      for (let i = 0; i < cashFlows.length; i++) {
+        const val = cashFlows[i];
+        const prevCum = cumulative;
+        cumulative += val;
+
+        if (cumulative >= 0) {
+          if (i === 0) return 0;
+          // Interpolate
+          // Amount needed = -prevCum
+          // Inflow this year = val (+ve)
+          // Assumption: cash flow arrives linearly throughout the year
+          // If val is 0, avoid division, just return i
+          if (val === 0) return i;
+          const fraction = Math.abs(prevCum) / val;
+          return (i - 1) + fraction;
+        }
+      }
+      return null; // > Lifespan
+    };
+
+    const calculateBCR = (benefitsPV, costsPV) => {
+      // BCR = PV(Benefits) / PV(Costs)
+      // Costs should be positive number for denominator
+      if (costsPV === 0) return 0;
+      return benefitsPV / costsPV;
+    };
+
+    const analyzeOption = (option, config, projectInfo) => {
       const { lifespan, inflationRate, discountRate } = config;
       const cashFlows = [];
+      const netCashFlows = []; // For IRR/PB (Net of Costs and Benefits)
       let totalNPV = 0;
+      let totalPVCosts = 0;
+      let totalPVBenefits = 0;
+
+      // Risk Benefit Calculation (Annual Base)
+      let riskBenefitBase = 0;
+      if (projectInfo && projectInfo.includeJFactor !== false && projectInfo.riskSeverity && projectInfo.riskLikelihood) {
+        const severityMap = { 0: 0, 1: 100000, 2: 500000, 3: 1000000, 4: 5000000, 5: 20000000 };
+        const likelihoodMap = { 'A': 0.1, 'B': 10, 'C': 100, 'D': 1000, 'E': 10000 };
+        const exposureMap = { 'Continuous': 1.0, 'Daily': 0.8, 'Weekly': 0.5, 'Monthly': 0.3, 'Yearly': 0.1 };
+
+        const ramCost = severityMap[projectInfo.riskSeverity] || 0;
+        const lFactor = likelihoodMap[projectInfo.riskLikelihood] || 0;
+        const eFactor = exposureMap[option.exposureFactor || 'Yearly'] || 0.1;
+        const riskReduction = (option.riskReduction || 0) / 100;
+
+        riskBenefitBase = ramCost * lFactor * eFactor * riskReduction;
+      }
 
       let cumulativeNPV = option.initialCost;
+
+      // Year 0
+      // Cost: Initial
+      // Benefit: 0
+      // Net: -Initial
       cashFlows.push({
         year: 0,
         cost: option.initialCost,
@@ -323,7 +403,10 @@
         cumulativeNPV,
         initialCost: option.initialCost, maintenanceCost: 0, operationCost: 0, failureCost: 0, safetyCost: 0, eolCost: 0
       });
+      netCashFlows.push(-option.initialCost);
       totalNPV += option.initialCost;
+      totalPVCosts += option.initialCost; // PV at t=0 is value
+
 
       // Initialize Itemized Data
       const itemized = {
@@ -378,6 +461,22 @@
         totalNPV += discountedCost;
         cumulativeNPV += discountedCost;
 
+        // Track Total PV Costs (excluding benefits/offsets like salvage if they were mixed)
+        // Here futureCost includes -Salvage if EOL. We need to separate for BCR.
+        // yearlyCostRaw has Costs (+ve) and -Salvage (-ve) at EOL.
+        // We need Gross Cost (for Denominator) and Gross Benefit (for Numerator).
+
+        const yearlyGrossCostRaw = maintenanceRaw + operationRaw + failureRaw + safetyRaw + (year === lifespan ? option.demolishCost : 0);
+        const yearlyGrossBenefitRaw = riskBenefitBase + (year === lifespan ? option.salvageValue : 0);
+
+        const futureGrossCost = calculateFutureCost(yearlyGrossCostRaw, inflationRate, year);
+        const futureGrossBenefit = calculateFutureCost(yearlyGrossBenefitRaw, inflationRate, year);
+
+        totalPVCosts += calculatePV(futureGrossCost, discountRate, year);
+        totalPVBenefits += calculatePV(futureGrossBenefit, discountRate, year);
+
+        netCashFlows.push(futureGrossBenefit - futureGrossCost);
+
         cashFlows.push({
           year,
           cost: futureCost,
@@ -390,6 +489,11 @@
           eolCost: year === lifespan ? calculatePV(calculateFutureCost(eolValueRaw, inflationRate, year), discountRate, year) : 0
         });
       }
+
+      // Metrics Calculation
+      const irr = calculateIRR(netCashFlows);
+      const paybackPeriod = calculatePaybackPeriod(netCashFlows);
+      const bcr = calculateBCR(totalPVBenefits, totalPVCosts);
 
       const r = discountRate / 100;
       const n = lifespan;
@@ -423,10 +527,80 @@
         }
       }
 
-      return { optionId: option.id, totalNPV, eac, cashFlows, breakdown: { initial: option.initialCost, maintenance: maintenanceNPV, operation: operationNPV, failure: failureNPV, safety: safetyNPV, endOfLife: endOfLifeNPV, itemized } };
+      const netNPV = totalPVBenefits - totalPVCosts;
+
+      return { optionId: option.id, totalNPV, eac, irr, paybackPeriod, bcr, netNPV, cashFlows, breakdown: { initial: option.initialCost, maintenance: maintenanceNPV, operation: operationNPV, failure: failureNPV, safety: safetyNPV, endOfLife: endOfLifeNPV, itemized } };
     };
 
-    const analyzeAll = (options, config) => options.map(opt => analyzeOption(opt, config));
+    const analyzeAll = (options, config, projectInfo) => {
+      const rawResults = options.map(opt => analyzeOption(opt, config, projectInfo));
+
+      if (rawResults.length === 0) return [];
+
+      // Baseline is Option 1 (Index 0)
+      const baseline = rawResults[0];
+
+      return rawResults.map((res, index) => {
+        if (index === 0) {
+          // Option 1 (Baseline)
+          // Metrics relative to itself are 0 or N/A
+          return { ...res, netNPV: 0, irr: null, paybackPeriod: null, bcr: 1.0 };
+        }
+
+        // Incremental Analysis: Baseline - Option
+        // "Savings" = Base Cost - Option Cost
+        // If Option Cost < Base Cost, it's a Saving (+ve)
+        // If Option Cost > Base Cost, it's an Expense (-ve) (e.g. Investment)
+
+        const incrementalCashFlows = [];
+        let totalDiscountedSavings = 0;  // For Net NPV
+
+        let pvPositiveDiffs = 0; // For BCR Numerator
+        let pvNegativeDiffs = 0; // For BCR Denominator
+
+        // Assuming same lifespan and start year
+        // Align by year index
+        const maxLen = Math.max(baseline.cashFlows.length, res.cashFlows.length);
+
+        for (let i = 0; i < maxLen; i++) {
+          const baseCF = baseline.cashFlows[i] || { cost: 0, discountedCost: 0 };
+          const optCF = res.cashFlows[i] || { cost: 0, discountedCost: 0 };
+
+          // Undiscounted Difference (for IRR, PB)
+          // Cost is +ve number. Saving = Base - Opt.
+          const diff = baseCF.cost - optCF.cost;
+          incrementalCashFlows.push(diff);
+
+          // Discounted Difference (for BCR)
+          const diffPV = baseCF.discountedCost - optCF.discountedCost;
+          totalDiscountedSavings += diffPV;
+
+          if (diffPV > 0) {
+            pvPositiveDiffs += diffPV;
+          } else {
+            pvNegativeDiffs += Math.abs(diffPV);
+          }
+        }
+
+        const irr = calculateIRR(incrementalCashFlows);
+        const paybackPeriod = calculatePaybackPeriod(incrementalCashFlows);
+
+        // BCR = PV(Savings) / PV(Extra Costs)
+        // If pure savings (always cheaper), BCR is Infinity? Or handle gracefully.
+        // If pure extra cost (always more expensive), BCR is 0.
+        let bcr = 0;
+        if (pvNegativeDiffs === 0) {
+          bcr = pvPositiveDiffs > 0 ? 999 : 0; // 999 as proxy for Infinity/Excellent
+        } else {
+          bcr = pvPositiveDiffs / pvNegativeDiffs;
+        }
+
+        // Net Study Value = Total Savings (NPV Base - NPV Option)
+        const netNPV = baseline.totalNPV - res.totalNPV;
+
+        return { ...res, netNPV, irr, paybackPeriod, bcr };
+      });
+    };
 
     // -------------------------------------------------------------
     // CONTEXT
@@ -436,7 +610,7 @@
 
     const LCCProvider = ({ children, activeProjectId }) => {
       const [options, setOptions] = useState([]);
-      const [config, setConfig] = useState({ lifespan: 10, inflationRate: 3, discountRate: 5, currency: 'THB', exchangeRate: 34.0 });
+      const [config, setConfig] = useState({ lifespan: 10, inflationRate: 3, discountRate: 5, hurdleRate: 8.8, currency: 'THB', exchangeRate: 34.0 });
       const [projectInfo, setProjectInfo] = useState({
         name: 'New LCC Analysis', asset: '', description: '', analyst: '', date: new Date().toISOString().split('T')[0]
       });
@@ -502,9 +676,9 @@
       const updateOption = (id, data) => setOptions(options.map(o => o.id === id ? { ...o, ...data } : o));
       const updateConfig = (data) => setConfig({ ...config, ...data });
       const updateProjectInfo = (data) => setProjectInfo({ ...projectInfo, ...data });
-      const runAnalysis = () => setResults(analyzeAll(options, config));
+      const runAnalysis = () => setResults(analyzeAll(options, config, projectInfo));
 
-      useEffect(() => { if (results.length > 0) runAnalysis(); }, [options, config]);
+      useEffect(() => { runAnalysis(); }, [options, config, projectInfo]);
 
       return (
         <LCCContext.Provider value={{ options, config, projectInfo, results, theme, addOption, removeOption, updateOption, updateConfig, updateProjectInfo, runAnalysis, toggleTheme }}>
@@ -665,7 +839,7 @@
     const SelectionModal = ({ isOpen, onClose, onSelect, title, options }) => {
       if (!isOpen) return null;
       return ReactDOM.createPortal(
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+        <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
           <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-6 w-full max-w-sm space-y-4 border border-gray-100 dark:border-white/10 scale-100 animate-in zoom-in-95 duration-200">
             <div className="flex justify-between items-center">
               <h3 className="font-bold text-lg text-gray-900 dark:text-white">{title}</h3>
@@ -684,8 +858,78 @@
       );
     };
 
+    const MANHOUR_RATES = {
+      'Junior': 576,
+      'Supervisor': 867,
+      'Senior': 1206,
+      'Section Head': 2631,
+      'Management': 4263
+    };
+
+    const ManhourCalculator = ({ isOpen, onClose, onAdd }) => {
+      const [role, setRole] = useState('Junior');
+      const [people, setPeople] = useState(1);
+      const [hours, setHours] = useState(0);
+
+      if (!isOpen) return null;
+
+      const rate = MANHOUR_RATES[role] || 0;
+      const total = rate * people * hours;
+
+      const handleSave = () => {
+        onAdd({
+          name: `Manhour: ${role} (${people}p x ${hours}h)`,
+          value: total,
+          frequency: 'yearly'
+        });
+        onClose();
+      };
+
+      return ReactDOM.createPortal(
+        <div className="fixed inset-0 z-[220] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+          <Card className="w-full max-w-sm shadow-2xl border-0">
+            <CardHeader className="flex flex-row items-center justify-between pb-2 bg-slate-50 dark:bg-slate-900 rounded-t-xl border-b">
+              <h3 className="font-bold text-lg">Manhour Cost Calculator</h3>
+              <Button variant="ghost" size="sm" onClick={onClose}><Icons.X className="h-4 w-4" /></Button>
+            </CardHeader>
+            <CardContent className="space-y-4 pt-4">
+              <div className="space-y-1">
+                <label className="text-xs font-bold uppercase text-gray-500">Responsible Person</label>
+                <select
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  value={role}
+                  onChange={e => setRole(e.target.value)}
+                >
+                  {Object.keys(MANHOUR_RATES).map(r => (
+                    <option key={r} value={r} className="dark:bg-slate-800">{r}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label className="text-xs font-bold uppercase text-gray-500">No. People</label>
+                  <Input type="number" min="1" value={people} onChange={e => setPeople(parseInt(e.target.value) || 0)} />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-bold uppercase text-gray-500">Hours / Year</label>
+                  <Input type="number" min="0" value={hours} onChange={e => setHours(parseFloat(e.target.value) || 0)} />
+                </div>
+              </div>
+              <div className="rounded-lg bg-slate-100 dark:bg-slate-800 p-3 flex justify-between items-center">
+                <span className="text-sm font-medium">Total Cost:</span>
+                <span className="text-lg font-bold text-indigo-600 dark:text-indigo-400">{total.toLocaleString()}</span>
+              </div>
+              <Button className="w-full" onClick={handleSave}>Add to Cost</Button>
+            </CardContent>
+          </Card>
+        </div>,
+        document.body
+      );
+    };
+
     const DynamicCostList = ({ title, items, onChange, categories, color = "blue", buttonLabel }) => {
       const [isModalOpen, setIsModalOpen] = useState(false);
+      const [isManhourOpen, setIsManhourOpen] = useState(false);
       const updateItem = (id, updates) => onChange(items.map(i => i.id === id ? { ...i, ...updates } : i));
       const removeItem = (id) => onChange(items.filter(i => i.id !== id));
 
@@ -698,8 +942,16 @@
       };
 
       const handleSelectCategory = (category) => {
-        onChange([...items, { id: Math.random().toString(36).substr(2, 9), name: category, value: 0, frequency: 'yearly' }]);
         setIsModalOpen(false);
+        if (category === "Manhour cost") {
+          setIsManhourOpen(true);
+        } else {
+          onChange([...items, { id: Math.random().toString(36).substr(2, 9), name: category, value: 0, frequency: 'yearly' }]);
+        }
+      };
+
+      const handleAddManhour = (data) => {
+        onChange([...items, { id: Math.random().toString(36).substr(2, 9), ...data }]);
       };
 
       return (
@@ -719,6 +971,12 @@
               options={categories}
             />
           )}
+
+          <ManhourCalculator
+            isOpen={isManhourOpen}
+            onClose={() => setIsManhourOpen(false)}
+            onAdd={handleAddManhour}
+          />
 
           <div className="space-y-3">
             {items.map(item => (
@@ -747,15 +1005,25 @@
 
     const MaintenanceCostList = ({ items, onChange, color = "indigo" }) => {
       const [isModalOpen, setIsModalOpen] = useState(false);
+      const [isManhourOpen, setIsManhourOpen] = useState(false);
       const updateItem = (id, updates) => onChange(items.map(i => i.id === id ? { ...i, ...updates } : i));
       const removeItem = (id) => onChange(items.filter(i => i.id !== id));
 
       const handleAdd = (category) => {
-        onChange([...items, { id: Math.random().toString(36).substr(2, 9), name: category, value: 0, frequency: 'yearly' }]);
         setIsModalOpen(false);
+        if (category === "Manhour cost") {
+          setIsManhourOpen(true);
+        } else {
+          onChange([...items, { id: Math.random().toString(36).substr(2, 9), name: category, value: 0, frequency: 'yearly' }]);
+        }
+      };
+
+      const handleAddManhour = (data) => {
+        onChange([...items, { id: Math.random().toString(36).substr(2, 9), ...data }]);
       };
 
       const categories = [
+        "Manhour cost",
         "Major replacement cost",
         "Minor replacement, repair and PM maintenance cost",
         "Maintenance item cost",
@@ -776,6 +1044,12 @@
             onSelect={handleAdd}
             title="Select Maintenance Category"
             options={categories}
+          />
+
+          <ManhourCalculator
+            isOpen={isManhourOpen}
+            onClose={() => setIsManhourOpen(false)}
+            onAdd={handleAddManhour}
           />
 
           <div className="space-y-3">
@@ -920,136 +1194,217 @@
       return { decision: '-', color: 'text-gray-400' };
     }
 
-    const OptionCard = ({ option }) => {
-      const { updateOption, removeOption, options, projectInfo } = useLCC();
+    const OptionContent = ({ option }) => {
+      const { updateOption, projectInfo } = useLCC();
 
       // Helpers for J-Factor Dislay
       const riskLevel = calculateRiskLevelForFactor(projectInfo.riskSeverity, projectInfo.riskLikelihood);
       const likelihoodFactor = calculateLikelihoodFactor(projectInfo.riskLikelihood);
       const mediumRAM = calculateMediumRAM(projectInfo.riskSeverity);
       const exposureFactor = calculateExposureFactor(option.exposureFactor || 'Yearly');
-      const percentExposure = exposureFactor; // Requirement says "%Exposure Factor uses data from Exposure Factor... Continuous=1" etc. It is the same value.
+      const percentExposure = exposureFactor;
       const justifyCost = mediumRAM * likelihoodFactor * percentExposure;
-
       const jFactor = calculateJFactor(projectInfo, option);
-      const decision = getInvestmentDecision(jFactor, riskLevel);
 
       return (
-        <Card className="min-w-[360px] w-[360px] shrink-0 flex flex-col h-full border-t-[6px] border-t-indigo-500/80 dark:border-t-indigo-500">
-          <CardHeader className="flex justify-between items-center bg-gradient-to-b from-white to-gray-50/20 dark:from-white/5 dark:to-transparent border-b border-gray-100/50 dark:border-white/5">
-            <Input className="font-bold text-lg text-gray-900 dark:text-white border-transparent bg-transparent shadow-none focus:bg-white dark:focus:bg-white/10 focus:shadow-sm px-0" value={option.name} onChange={e => updateOption(option.id, { name: e.target.value })} />
-            {options.length > 1 && <Button variant="ghost" size="sm" onClick={() => removeOption(option.id)} className="opacity-50 hover:opacity-100"><Icons.Trash2 className="h-4 w-4 text-gray-500 dark:text-gray-400 hover:text-red-600 dark:hover:text-red-400 top-0" /></Button>}
-          </CardHeader>
-          <CardContent className="space-y-6 overflow-y-auto max-h-[600px] flex-1 bg-white/30 dark:bg-transparent">
-            <textarea
-              className="w-full rounded-xl border border-gray-200/60 dark:border-white/10 bg-white/40 dark:bg-white/5 px-3 py-2 text-sm text-gray-600 dark:text-gray-300 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 resize-none h-16 min-h-[4rem]"
-              placeholder="Option description (e.g. specs, warranty)..."
-              value={option.description || ''}
-              onChange={e => updateOption(option.id, { description: e.target.value })}
+        <div className="space-y-6">
+          <textarea
+            className="w-full rounded-xl border border-gray-200/60 dark:border-white/10 bg-white/40 dark:bg-white/5 px-3 py-2 text-sm text-gray-600 dark:text-gray-300 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 resize-none h-16 min-h-[4rem]"
+            placeholder="Option description (e.g. specs, warranty)..."
+            value={option.description || ''}
+            onChange={e => updateOption(option.id, { description: e.target.value })}
+          />
+          <OptionSection
+            title="1. Initial Investment"
+            color="blue"
+            rightElement={<span className="text-xs font-bold text-blue-600 dark:text-blue-400">Total: {parseFloat(option.initialCosts?.reduce((sum, i) => sum + i.value, 0) || option.initialCost || 0).toLocaleString()}</span>}
+          >
+            <InitialCostList
+              items={option.initialCosts || [{ id: 'base', name: 'Base Cost', value: option.initialCost || 0 }]}
+              onChange={items => {
+                const total = items.reduce((sum, i) => sum + i.value, 0);
+                updateOption(option.id, { initialCosts: items, initialCost: total });
+              }}
             />
-            <OptionSection
-              title="1. Initial Investment"
-              color="blue"
-              rightElement={<span className="text-xs font-bold text-blue-600 dark:text-blue-400">Total: {parseFloat(option.initialCosts?.reduce((sum, i) => sum + i.value, 0) || option.initialCost || 0).toLocaleString()}</span>}
-            >
-              <InitialCostList
-                items={option.initialCosts || [{ id: 'base', name: 'Base Cost', value: option.initialCost || 0 }]}
-                onChange={items => {
-                  const total = items.reduce((sum, i) => sum + i.value, 0);
-                  updateOption(option.id, { initialCosts: items, initialCost: total });
-                }}
-              />
-            </OptionSection>
+          </OptionSection>
 
-            <MaintenanceCostList items={option.maintenanceCosts} onChange={i => updateOption(option.id, { maintenanceCosts: i })} />
+          <MaintenanceCostList items={option.maintenanceCosts} onChange={i => updateOption(option.id, { maintenanceCosts: i })} />
 
-            <DynamicCostList
-              title="3. Operation"
-              items={option.operationCosts}
-              onChange={i => updateOption(option.id, { operationCosts: i })}
-              color="cyan"
-              buttonLabel="Add Operation Cost Item"
-              categories={[
-                "Manhour cost",
-                "Spare parts consumption cost",
-                "logistic support cost",
-                "Energy consumption cost"
-              ]}
-            />
-            <DynamicCostList title="4. Failure, Downtime & Production Loss" color="rose" items={option.failureCosts} onChange={i => updateOption(option.id, { failureCosts: i })} buttonLabel="Add Failure Cost Item" />
-            <DynamicCostList title="5. Safety, Environmental & Regulatory" color="emerald" items={option.safetyCosts} onChange={i => updateOption(option.id, { safetyCosts: i })} buttonLabel="Add Safety Cost Item" />
+          <DynamicCostList
+            title="3. Operation"
+            items={option.operationCosts}
+            onChange={i => updateOption(option.id, { operationCosts: i })}
+            color="cyan"
+            buttonLabel="Add Operation Cost Item"
+            categories={[
+              "Manhour cost",
+              "Spare parts consumption cost",
+              "logistic support cost",
+              "Energy consumption cost"
+            ]}
+          />
+          <DynamicCostList title="4. Failure, Downtime & Production Loss" color="rose" items={option.failureCosts} onChange={i => updateOption(option.id, { failureCosts: i })} buttonLabel="Add Failure Cost Item" />
+          <DynamicCostList title="5. Safety, Environmental & Regulatory" color="emerald" items={option.safetyCosts} onChange={i => updateOption(option.id, { safetyCosts: i })} buttonLabel="Add Safety Cost Item" />
 
-            <OptionSection title="6. End of Life" color="orange">
-              <NumericInput label="Demolish Cost (+)" tooltip="ค่าใช้จ่ายในการรื้อถอนกำจัดเมื่อหมดอายุการใช้งาน" value={option.demolishCost} onChange={e => updateOption(option.id, { demolishCost: parseFloat(e.target.value) || 0 })} />
-              <NumericInput label="Salvage Value (-)" tooltip="มูลค่าซากที่ขายได้ หรือมูลค่าที่เหลืออยู่เมื่อหมดอายุ" value={option.salvageValue} onChange={e => updateOption(option.id, { salvageValue: parseFloat(e.target.value) || 0 })} />
-            </OptionSection>
+          <OptionSection title="6. End of Life" color="orange">
+            <NumericInput label="Demolish Cost (+)" tooltip="ค่าใช้จ่ายในการรื้อถอนกำจัดเมื่อหมดอายุการใช้งาน" value={option.demolishCost} onChange={e => updateOption(option.id, { demolishCost: parseFloat(e.target.value) || 0 })} />
+            <NumericInput label="Salvage Value (-)" tooltip="มูลค่าที่เหลืออยู่เมื่อหมดอายุ (นำไปหักลบกับต้นทุน)" value={option.salvageValue} onChange={e => updateOption(option.id, { salvageValue: parseFloat(e.target.value) || 0 })} />
+          </OptionSection>
 
-            <OptionSection title="7. J-Factor Analysis" color="purple">
-              {/* A. Evaluate cost of risk */}
-              <div className="flex justify-between items-center text-sm border-b border-purple-100 dark:border-white/5 pb-2">
-                <span className="text-gray-600 dark:text-gray-300">Current Risk Level:</span>
-                <span className={cn("font-bold",
-                  (riskLevel === 'H') ? "text-red-600" :
-                    (riskLevel === 'M') ? "text-yellow-600" :
-                      (riskLevel === 'L' || riskLevel === 'L/N') ? "text-green-600" : "text-gray-400"
-                )}>{riskLevel}</span>
+          <OptionSection title="7. J-Factor Analysis" color="purple">
+            {/* A. Evaluate cost of risk */}
+            <div className="flex justify-between items-center text-sm border-b border-purple-100 dark:border-white/5 pb-2">
+              <span className="text-gray-600 dark:text-gray-300">Current Risk Level:</span>
+              <span className={cn("font-bold",
+                (riskLevel === 'H') ? "text-red-600" :
+                  (riskLevel === 'M') ? "text-yellow-600" :
+                    (riskLevel === 'L' || riskLevel === 'L/N') ? "text-green-600" : "text-gray-400"
+              )}>{riskLevel}</span>
+            </div>
+
+            {/* B. Justify cost of risk */}
+            <div className="space-y-2 pt-2">
+              <h5 className="text-[10px] font-bold text-gray-500 uppercase">Justify Cost of Risk</h5>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="text-gray-500">Medium RAM Level:</div>
+                <div className="text-right font-medium">{mediumRAM.toLocaleString()} Baht</div>
+                <div className="text-gray-500">Likelihood Factor:</div>
+                <div className="text-right font-medium">{likelihoodFactor.toFixed(2)}</div>
               </div>
-
-              {/* B. Justify cost of risk */}
-              <div className="space-y-2 pt-2">
-                <h5 className="text-[10px] font-bold text-gray-500 uppercase">Justify Cost of Risk</h5>
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="text-gray-500">Medium RAM Level:</div>
-                  <div className="text-right font-medium">{mediumRAM.toLocaleString()} Baht</div>
-                  <div className="text-gray-500">Likelihood Factor:</div>
-                  <div className="text-right font-medium">{likelihoodFactor.toFixed(2)}</div>
-                </div>
-                <div className="w-full">
-                  <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Exposure Factor</label>
-                  <select
-                    className="flex h-8 w-full rounded-lg border border-gray-200 dark:border-white/10 bg-white/50 dark:bg-slate-800 px-2 text-xs text-gray-900 dark:text-gray-100"
-                    value={option.exposureFactor || 'Yearly'}
-                    onChange={e => updateOption(option.id, { exposureFactor: e.target.value })}
-                  >
-                    <option value="Continuous" className="dark:bg-slate-800">Continuous (1.0)</option>
-                    <option value="Daily" className="dark:bg-slate-800">Daily (0.8)</option>
-                    <option value="Weekly" className="dark:bg-slate-800">Weekly (0.5)</option>
-                    <option value="Monthly" className="dark:bg-slate-800">Monthly (0.3)</option>
-                    <option value="Yearly" className="dark:bg-slate-800">Yearly (0.1)</option>
-                  </select>
-                </div>
-                <div className="flex justify-between items-center bg-white/40 dark:bg-white/5 p-2 rounded-lg">
-                  <span className="text-xs font-medium text-gray-700 dark:text-gray-300">Justify Cost (Baht):</span>
-                  <span className="text-sm font-bold text-indigo-700 dark:text-indigo-400">{Math.round(justifyCost).toLocaleString()}</span>
-                </div>
+              <div className="w-full">
+                <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">Exposure Factor</label>
+                <select
+                  className="flex h-8 w-full rounded-lg border border-gray-200 dark:border-white/10 bg-white/50 dark:bg-slate-800 px-2 text-xs text-gray-900 dark:text-gray-100"
+                  value={option.exposureFactor || 'Yearly'}
+                  onChange={e => updateOption(option.id, { exposureFactor: e.target.value })}
+                >
+                  <option value="Continuous" className="dark:bg-slate-800">Continuous (1.0)</option>
+                  <option value="Daily" className="dark:bg-slate-800">Daily (0.8)</option>
+                  <option value="Weekly" className="dark:bg-slate-800">Weekly (0.5)</option>
+                  <option value="Monthly" className="dark:bg-slate-800">Monthly (0.3)</option>
+                  <option value="Yearly" className="dark:bg-slate-800">Yearly (0.1)</option>
+                </select>
               </div>
+              <div className="flex justify-between items-center bg-white/40 dark:bg-white/5 p-2 rounded-lg">
+                <span className="text-xs font-medium text-gray-700 dark:text-gray-300">Justify Cost (Baht):</span>
+                <span className="text-sm font-bold text-indigo-700 dark:text-indigo-400">{Math.round(justifyCost).toLocaleString()}</span>
+              </div>
+            </div>
 
-              {/* C. Evaluate % risk reduction */}
-              <div className="space-y-1 pt-1">
-                <label className="block text-[10px] font-bold text-gray-500 uppercase">Risk Reduction (%)</label>
-                <Input
-                  type="number"
-                  min="0" max="100"
-                  className="h-8 text-sm"
-                  value={option.riskReduction}
-                  onChange={e => updateOption(option.id, { riskReduction: parseFloat(e.target.value) || 0 })}
-                  placeholder="0-100"
+            {/* C. Evaluate % risk reduction */}
+            <div className="pt-2 border-t border-purple-100 dark:border-white/5">
+              <label className="block text-[10px] font-bold text-gray-500 uppercase mb-1">% Risk Reduction (C)</label>
+              <div className="flex gap-2 items-center">
+                <Input type="number" className="h-8 text-sm" value={option.riskReduction} onChange={e => updateOption(option.id, { riskReduction: parseFloat(e.target.value) || 0 })} placeholder="e.g. 90" />
+                <span className="text-gray-500 text-xs">%</span>
+              </div>
+            </div>
+
+            <div className="mt-3 p-2 rounded-lg bg-green-50 dark:bg-green-900/10 border border-green-100 dark:border-green-500/10 flex items-center justify-between">
+              <div className="flex flex-col">
+                <span className="text-[10px] font-bold text-green-700 dark:text-green-400 uppercase">J-Factor Score</span>
+                <span className="text-xs text-green-600/70 dark:text-green-400/70">Lower is better? No, higher &gt; criteria</span>
+              </div>
+              <span className="text-xl font-black text-green-600 dark:text-green-400">{jFactor.toFixed(2)}</span>
+            </div>
+          </OptionSection>
+        </div>
+      );
+    };
+
+    const FocusModeModal = ({ option, onClose }) => {
+      const { updateOption } = useLCC();
+
+      // Close on escape
+      useEffect(() => {
+        const handleEsc = (e) => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', handleEsc);
+        return () => window.removeEventListener('keydown', handleEsc);
+      }, [onClose]);
+
+      return ReactDOM.createPortal(
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-[#1a103c] rounded-2xl shadow-2xl w-full max-w-5xl h-[90vh] flex flex-col border border-gray-100 dark:border-white/10 overflow-hidden relative">
+            {/* Header */}
+            <div className="flex justify-between items-center p-6 border-b border-gray-100 dark:border-white/5 bg-white/50 dark:bg-white/5 backdrop-blur-md">
+              <div className="flex-1 mr-8">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="px-2 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 text-xs font-bold uppercase tracking-wider">
+                    Focus Mode
+                  </span>
+                </div>
+                <input
+                  className="text-3xl font-bold text-gray-900 dark:text-white bg-transparent border-none focus:ring-0 p-0 w-full placeholder:text-gray-300 dark:placeholder:text-gray-600"
+                  value={option.name}
+                  onChange={e => updateOption(option.id, { name: e.target.value })}
                 />
               </div>
-
-              {/* D. J-Factor & Decision */}
-              <div className="pt-2 border-t border-purple-100 dark:border-white/5">
-                <div className="flex justify-between items-center mb-1">
-                  <span className="text-xs font-bold text-gray-600 dark:text-gray-400">J-Factor Score:</span>
-                  <span className="text-lg font-black text-gray-800 dark:text-white">{jFactor.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between items-center bg-white dark:bg-white/10 p-2 rounded-lg border border-purple-100 dark:border-white/10 text-center">
-                  <span className="text-xs font-medium text-gray-500">Decision:</span>
-                  <span className={cn("font-bold uppercase tracking-wider", decision.color)}>{decision.decision}</span>
-                </div>
+              <div className="flex items-center gap-2">
+                <Button variant="secondary" onClick={onClose} className="rounded-full w-12 h-12 p-0 shadow-lg hover:bg-gray-100 dark:hover:bg-white/10 transition-all duration-200">
+                  <Icons.X className="h-6 w-6" />
+                </Button>
               </div>
-            </OptionSection>
+            </div>
+
+            {/* Body */}
+            <div className="flex-1 overflow-y-auto p-4 md:p-8 bg-gray-50/50 dark:bg-transparent">
+              <div className="max-w-3xl mx-auto">
+                <OptionContent option={option} />
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      );
+    };
+
+    const OptionCard = ({ option }) => {
+      const { updateOption, removeOption, options, projectInfo } = useLCC();
+      const [isFocused, setIsFocused] = useState(false);
+
+      return (
+        <Card className="min-w-[360px] w-[360px] shrink-0 flex flex-col h-full border-t-[6px] border-t-indigo-500/80 dark:border-t-indigo-500 bg-white/60 dark:bg-white/5 backdrop-blur-md shadow-lg">
+          {/* Header */}
+          <CardHeader className="flex flex-row justify-between items-center bg-gray-50/50 dark:bg-white/5 border-b border-gray-100 dark:border-white/5 p-4">
+            <div className="flex-1 mr-2 min-w-0">
+              <input
+                className="font-bold text-lg text-gray-900 dark:text-white border-transparent bg-transparent shadow-none focus:bg-white dark:focus:bg-white/10 focus:shadow-sm px-0 w-full truncate placeholder-gray-400"
+                value={option.name}
+                onChange={e => updateOption(option.id, { name: e.target.value })}
+                placeholder="Option Name"
+              />
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                onClick={() => setIsFocused(true)}
+                className="p-2 text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-white/5 rounded-lg transition-colors"
+                title="Focus Mode"
+              >
+                <Icons.Maximize className="h-4 w-4" />
+              </button>
+              {options.length > 1 && (
+                <button
+                  onClick={() => {
+                    if (confirm('Are you sure you want to delete this option?')) {
+                      removeOption(option.id);
+                    }
+                  }}
+                  className="p-2 text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                  title="Delete Option"
+                >
+                  <Icons.Trash2 className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+          </CardHeader>
+
+          {/* Content */}
+          <CardContent className="space-y-6 overflow-y-auto max-h-[600px] flex-1 custom-scrollbar p-4">
+            <OptionContent option={option} />
           </CardContent>
+
+          {/* Focus Mode Portal */}
+          {isFocused && <FocusModeModal option={option} onClose={() => setIsFocused(false)} />}
         </Card>
       );
     };
@@ -1263,6 +1618,7 @@
 
             <Input label="Inflation Rate (%)" tooltip="อัตราเงินเฟ้อเฉลี่ยต่อปี (%)" type="number" step="0.1" value={config.inflationRate} onChange={e => updateConfig({ inflationRate: parseFloat(e.target.value) || 0 })} className="text-lg font-medium text-violet-900 dark:text-violet-200" />
             <Input label="Discount Rate (%)" tooltip="อัตราคิดลด (%) ใช้สำหรับคำนวณมูลค่าปัจจุบัน (NPV) เพื่อเปรียบเทียบค่าเงินในเวลาที่ต่างกัน" type="number" step="0.1" value={config.discountRate} onChange={e => updateConfig({ discountRate: parseFloat(e.target.value) || 0 })} className="text-lg font-medium text-violet-900 dark:text-violet-200" />
+            <Input label="Hurdle Rate (%)" tooltip="The minimum acceptable rate of return on an investment (IRR Threshold)." type="number" step="0.1" value={config.hurdleRate} onChange={e => updateConfig({ hurdleRate: parseFloat(e.target.value) || 0 })} className="text-lg font-medium text-violet-900 dark:text-violet-200" />
             <div className="w-full">
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1 flex items-center">Currency</label>
               <select
@@ -1293,6 +1649,7 @@
                 <li>1. J-Factor criteria (Refer ADPE-QTD-01)</li>
                 <li>2. LCC Work instrution (Refer ENRM-QWI-XX)</li>
                 <li>3. ISO 55000:2024 Asset management</li>
+                <li>4. Hurdle Rate Guideline (Refer SPPS-QTD-02)</li>
               </ul>
             </div>
           </CardContent>
@@ -1456,6 +1813,11 @@
       const isBest = rank === 1;
       const savings = bestResult ? result.totalNPV - bestResult.totalNPV : 0; // Relative to best (0 for best)
 
+      // Metrics Data
+      const { netNPV, irr, paybackPeriod, bcr, optionId } = result;
+      const isBaseline = optionId === '1'; // Assuming Option 1 is always ID '1' and is Baseline
+      const hurdleRate = config.hurdleRate || 8.8;
+
       // Determine Badges
       const badges = [];
       if (option.initialCost === stats.minInitial) badges.push({ label: 'Lowest Initial Cost', color: 'bg-blue-100 text-blue-700' });
@@ -1463,14 +1825,30 @@
 
       const rankStyles = {
         1: "bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-2xl shadow-emerald-900/20 border-white/10",
-        2: "bg-white/80 dark:bg-white/10 backdrop-blur-md border-indigo-100 dark:border-indigo-500/20 shadow-xl", // Silver/Light
-        3: "bg-white/60 dark:bg-white/5 backdrop-blur-md border-orange-100 dark:border-orange-500/20 shadow-lg", // Bronze/Light
+        2: "bg-white/80 dark:bg-white/10 backdrop-blur-md border-indigo-100 dark:border-indigo-500/20 shadow-xl",
+        3: "bg-white/60 dark:bg-white/5 backdrop-blur-md border-orange-100 dark:border-orange-500/20 shadow-lg",
       };
 
       const rankBadgeStyles = {
         1: "bg-yellow-400 text-yellow-900 shadow-yellow-500/50",
         2: "bg-gray-200 text-gray-700",
         3: "bg-orange-200 text-orange-800",
+      };
+
+      // Helper for Metric Display
+      const MetricItem = ({ label, value, subtext, status }) => {
+        let statusColor = isBest ? "text-emerald-100" : "text-gray-500 dark:text-gray-400"; // Default
+        if (status === 'good') statusColor = isBest ? "text-white font-bold" : "text-emerald-600 dark:text-emerald-400 font-bold";
+        if (status === 'bad') statusColor = isBest ? "text-red-200 font-bold" : "text-red-500 font-bold";
+        if (status === 'neutral') statusColor = isBest ? "text-white/80" : "text-gray-700 dark:text-gray-300";
+
+        return (
+          <div className={cn("flex flex-col px-3 py-2 rounded-lg", isBest ? "bg-white/10" : "bg-gray-50/50 dark:bg-white/5 border border-gray-100 dark:border-white/5")}>
+            <span className={cn("text-[10px] font-bold uppercase tracking-wider mb-0.5", isBest ? "text-emerald-100/70" : "text-gray-400 dark:text-gray-500")}>{label}</span>
+            <span className={cn("text-lg leading-tight", statusColor)}>{value}</span>
+            {subtext && <span className={cn("text-[10px]", isBest ? "text-emerald-100/50" : "text-gray-400")}>{subtext}</span>}
+          </div>
+        );
       };
 
       return (
@@ -1482,35 +1860,70 @@
             </>
           )}
 
-          <div className="relative z-10 flex flex-col md:flex-row gap-6 items-start md:items-center">
-            <div className={cn("flex items-center justify-center w-12 h-12 rounded-xl font-black text-xl shadow-lg shrink-0", rankBadgeStyles[rank])}>
-              #{rank}
-            </div>
-
-            <div className="flex-1 min-w-0">
-              <div className="flex flex-wrap items-center gap-2 mb-2">
-                <h3 className={cn("text-2xl font-bold truncate", isBest ? "text-white" : "text-gray-800 dark:text-white")}>{option.name}</h3>
-                {isBest && <span className="px-2 py-0.5 rounded-full bg-white/20 text-white text-xs font-bold uppercase tracking-wider backdrop-blur-md border border-white/20">Winner</span>}
-                {badges.map((b, i) => <span key={i} className={cn("px-2 py-0.5 rounded-full text-xs font-bold uppercase tracking-wider", isBest ? "bg-white/20 text-white border border-white/20" : b.color)}>{b.label}</span>)}
-                {includeJFactor && jData && jData.decision !== '-' && (
-                  <span className={cn("px-2 py-0.5 rounded-full text-xs font-bold uppercase tracking-wider border",
-                    jData.decision === 'Invest' ? (isBest ? "bg-white/20 text-white border-white/20" : "bg-green-100 text-green-800 border-green-200 dark:bg-green-900/30 dark:text-green-300 dark:border-green-800") :
-                      jData.decision === 'Not Invest' ? (isBest ? "bg-white/20 text-white border-white/20" : "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800") :
-                        (isBest ? "bg-white/20 text-white border-white/20" : "bg-gray-100 text-gray-800 border-gray-200")
-                  )}>
-                    {jData.decision} (J={jData.score})
-                  </span>
-                )}
+          <div className="relative z-10 flex flex-col gap-6">
+            {/* Header Section */}
+            <div className="flex flex-col md:flex-row gap-4 items-start md:items-center">
+              <div className={cn("flex items-center justify-center w-12 h-12 rounded-xl font-black text-xl shadow-lg shrink-0", rankBadgeStyles[rank])}>
+                #{rank}
               </div>
-              <p className={cn("text-sm line-clamp-2", isBest ? "text-emerald-50" : "text-gray-500 dark:text-gray-400")}>{option.description || "No description provided."}</p>
+              <div className="flex-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2 mb-1">
+                  <h3 className={cn("text-2xl font-bold truncate", isBest ? "text-white" : "text-gray-800 dark:text-white")}>{option.name}</h3>
+                  {isBest && <span className="px-2 py-0.5 rounded-full bg-white/20 text-white text-xs font-bold uppercase tracking-wider backdrop-blur-md border border-white/20">Winner</span>}
+                  {badges.map((b, i) => <span key={i} className={cn("px-2 py-0.5 rounded-full text-xs font-bold uppercase tracking-wider", isBest ? "bg-white/20 text-white border border-white/20" : b.color)}>{b.label}</span>)}
+                  {includeJFactor && jData && jData.decision !== '-' && (
+                    <span className={cn("px-2 py-0.5 rounded-full text-xs font-bold uppercase tracking-wider border",
+                      jData.decision === 'Invest' ? (isBest ? "bg-white/20 text-white border-white/20" : "bg-green-100 text-green-800 border-green-200 dark:bg-green-900/30 dark:text-green-300 dark:border-green-800") :
+                        jData.decision === 'Not Invest' ? (isBest ? "bg-white/20 text-white border-white/20" : "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800") :
+                          (isBest ? "bg-white/20 text-white border-white/20" : "bg-gray-100 text-gray-800 border-gray-200")
+                    )}>
+                      {jData.decision} (J={jData.score})
+                    </span>
+                  )}
+                </div>
+                <p className={cn("text-sm line-clamp-2 mb-3", isBest ? "text-emerald-50" : "text-gray-500 dark:text-gray-400")}>{option.description || "No description provided."}</p>
+              </div>
+              <div className={cn("text-right shrink-0 p-3 rounded-xl min-w-[140px]", isBest ? "bg-white/10 border border-white/10" : "bg-gray-50 dark:bg-white/5 border border-gray-100 dark:border-white/5")}>
+                <p className={cn("text-xs font-bold uppercase tracking-wider mb-1", isBest ? "text-emerald-100" : "text-gray-400 dark:text-gray-500")}>Total NPV</p>
+                <div className={cn("text-2xl font-black tracking-tight", isBest ? "text-white" : "text-gray-900 dark:text-white")}>{fmt(result.totalNPV)}</div>
+                {!isBest && <p className="text-xs text-red-500 font-medium mt-1">+{fmt(Math.round(savings))} vs #1</p>}
+                {isBest && <p className="text-xs text-emerald-100 font-medium mt-1">Best Choice</p>}
+              </div>
             </div>
 
-            <div className={cn("text-right shrink-0 p-3 rounded-xl min-w-[140px]", isBest ? "bg-white/10 border border-white/10" : "bg-gray-50 dark:bg-white/5 border border-gray-100 dark:border-white/5")}>
-              <p className={cn("text-xs font-bold uppercase tracking-wider mb-1", isBest ? "text-emerald-100" : "text-gray-400 dark:text-gray-500")}>Total NPV</p>
-              <div className={cn("text-2xl font-black tracking-tight", isBest ? "text-white" : "text-gray-900 dark:text-white")}>{fmt(result.totalNPV)}</div>
-              {!isBest && <p className="text-xs text-red-500 font-medium mt-1">+{fmt(Math.round(savings))} vs #1</p>}
-              {isBest && <p className="text-xs text-emerald-100 font-medium mt-1">Best Choice</p>}
-            </div>
+            {/* Comparative Metrics Grid */}
+            {!isBaseline ? (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <MetricItem
+                  label="Net Study Value"
+                  value={fmt(netNPV)}
+                  subtext="vs Option 1"
+                  status={netNPV > 0 ? 'good' : 'bad'}
+                />
+                <MetricItem
+                  label="IRR"
+                  value={irr !== null ? `${typeof irr === 'number' ? irr.toFixed(2) : irr}%` : 'N/A'}
+                  subtext={`Hurdle: ${hurdleRate}%`}
+                  status={irr !== null ? (irr >= hurdleRate ? 'good' : 'bad') : 'neutral'}
+                />
+                <MetricItem
+                  label="Payback Period"
+                  value={paybackPeriod !== null ? `${typeof paybackPeriod === 'number' ? paybackPeriod.toFixed(2) : paybackPeriod} Yrs` : 'N/A'}
+                  subtext="Undiscounted"
+                  status="neutral"
+                />
+                <MetricItem
+                  label="BCR"
+                  value={bcr !== null ? (typeof bcr === 'number' ? bcr.toFixed(2) : bcr) : 'N/A'}
+                  subtext="Benefit/Cost Ratio"
+                  status={bcr !== null ? (bcr > 1 ? 'good' : 'bad') : 'neutral'}
+                />
+              </div>
+            ) : (
+              <div className={cn("text-xs text-center py-2 rounded-lg italic", isBest ? "bg-white/10 text-emerald-100" : "bg-gray-50 dark:bg-white/5 text-gray-400")}>
+                Baseline Option (Comparison Reference)
+              </div>
+            )}
           </div>
         </div>
       )
@@ -1652,8 +2065,12 @@
               <div className="p-1.5 bg-indigo-100 dark:bg-indigo-900/40 rounded-lg"><Icons.Info className="h-4 w-4 text-indigo-600 dark:text-indigo-400" /></div> Key Metrics
             </h4>
             <ul className="space-y-3 text-sm text-gray-600 dark:text-gray-400">
-              <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">NPV (Net Present Value):</span> <span>The total value of all future cash flows (costs) discounted to today's value. Lower is better.</span></li>
+              <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">NPV (Net Present Value):</span> <span>The total value of all future cash flows (costs) discounted to today's value. For pure cost analysis, lower is better.</span></li>
               <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">EAC (Equivalent Annual Cost):</span> <span>The annualized cost of owning and operating the asset over its lifespan. Useful for comparing options with different lifespans.</span></li>
+              <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">Net Study Value:</span> <span>The Net Present Value of Savings compared to Option 1 (Baseline). Positive means it saves money vs Option 1.</span></li>
+              <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">IRR (Internal Rate of Return):</span> <span>The return on investment calculated from the savings generated by choosing this option over Option 1.</span></li>
+              <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">Payback Period:</span> <span>Time required for the cumulative savings (vs Option 1) to cover the extra initial investment.</span></li>
+              <li className="flex gap-2"><span className="font-bold text-indigo-700 dark:text-indigo-400 whitespace-nowrap">BCR (Benefit-Cost Ratio):</span> <span>Ratio of "Savings" to "Extra Investment" compared to Option 1. BCR &gt; 1 means the savings justify the cost.</span></li>
             </ul>
           </div>
           <div className="bg-white/60 dark:bg-white/5 p-6 rounded-2xl border border-violet-100 dark:border-violet-500/20 shadow-sm backdrop-blur-sm">
@@ -2405,6 +2822,46 @@
                         ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 border-l-2 border-r-2 border-emerald-500 dark:border-emerald-400 relative z-20"
                         : "text-indigo-900 dark:text-indigo-300"
                     )}>{fmt(res.totalNPV)}</td>)}
+                  </tr>
+                  <tr>
+                    <td className="px-6 py-4 font-bold text-gray-600 dark:text-gray-300">Net Study Value (NPV)</td>
+                    {validResults.map(res => <td key={res.optionId} className={cn("px-6 py-4 text-right font-bold transition-all duration-300",
+                      res.optionId === bestId ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 border-l-2 border-r-2 border-emerald-500 dark:border-emerald-400 relative z-20" : "text-gray-600 dark:text-gray-300"
+                    )}>
+                      <span className={cn("px-2 py-1 rounded-md text-xs", (res.netNPV || 0) > 0 ? "bg-green-100 text-green-800" : "bg-red-50 text-red-800")}>
+                        {fmt(res.netNPV || 0)}
+                      </span>
+                    </td>)}
+                  </tr>
+                  <tr>
+                    <td className="px-6 py-4 font-bold text-gray-600 dark:text-gray-300">Internal Rate of Return (IRR)</td>
+                    {validResults.map(res => <td key={res.optionId} className={cn("px-6 py-4 text-right font-bold transition-all duration-300",
+                      res.optionId === bestId ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 border-l-2 border-r-2 border-emerald-500 dark:border-emerald-400 relative z-20" : "text-gray-600 dark:text-gray-300"
+                    )}>
+                      {res.irr !== null && res.irr !== undefined ? (
+                        <span className={cn("px-2 py-1 rounded-md text-xs", res.irr > (config.hurdleRate || 0) ? "bg-green-100 text-green-800" : "bg-red-50 text-red-800")}>
+                          {res.irr.toFixed(2)}%
+                        </span>
+                      ) : <span className="text-gray-400 text-xs">N/A</span>}
+                    </td>)}
+                  </tr>
+                  <tr>
+                    <td className="px-6 py-4 font-bold text-gray-600 dark:text-gray-300">Payback Period (Undiscounted)</td>
+                    {validResults.map(res => <td key={res.optionId} className={cn("px-6 py-4 text-right font-bold transition-all duration-300",
+                      res.optionId === bestId ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 border-l-2 border-r-2 border-emerald-500 dark:border-emerald-400 relative z-20" : "text-gray-600 dark:text-gray-300"
+                    )}>
+                      {res.paybackPeriod !== null && res.paybackPeriod !== undefined ? `${res.paybackPeriod.toFixed(1)} Years` : '> Lifespan'}
+                    </td>)}
+                  </tr>
+                  <tr>
+                    <td className="px-6 py-4 font-bold text-gray-600 dark:text-gray-300">Benefit-Cost Ratio (BCR)</td>
+                    {validResults.map(res => <td key={res.optionId} className={cn("px-6 py-4 text-right font-bold transition-all duration-300",
+                      res.optionId === bestId ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 border-l-2 border-r-2 border-emerald-500 dark:border-emerald-400 relative z-20" : "text-gray-600 dark:text-gray-300"
+                    )}>
+                      <span className={cn("px-2 py-1 rounded-md text-xs", (res.bcr || 0) > 1 ? "bg-green-100 text-green-800" : "bg-red-50 text-red-800")}>
+                        {(res.bcr || 0).toFixed(2)}
+                      </span>
+                    </td>)}
                   </tr>
                   {projectInfo.includeJFactor !== false && (
                     <tr className="bg-gray-50/50 dark:bg-white/5 border-b border-gray-100 dark:border-white/10">
