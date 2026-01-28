@@ -292,6 +292,123 @@
         };
         ProjectStorage.saveProject(id, initialData);
         return id;
+      },
+
+      createExampleProject: () => {
+        const id = 'proj_' + Math.random().toString(36).substr(2, 9);
+        const projectData = {
+          config: { lifespan: 6, inflationRate: 3, discountRate: 5, hurdleRate: 8.8, currency: 'THB', exchangeRate: 34.0 },
+          projectInfo: {
+            name: 'Reference: K-1305 Sour oil leak',
+            description: 'ORTL: RA-2025-312 Since K-1305 was restarted after MTA 2025, the operator has observed an unusually high seal oil consumption of approximately 150 L/day, compared to the normal rate of about 60 L/day. This excessive consumption could potentially lead to an unplanned shutdown for mechanical repairs.',
+            asset: 'K-1305',
+            analyst: 'ENRM-RE-Thaninthon',
+            date: '2025-12-15',
+            riskSeverity: 2,
+            riskLikelihood: 'E',
+            includeJFactor: true
+          },
+          options: [
+            {
+              id: '1',
+              name: 'Option 1 Existing SHELL TURBO T46',
+              description: 'Use SHELL TURBO T46 consumption rate 150 L/D.',
+              initialCost: 0,
+              initialCosts: [],
+              maintenanceCosts: [
+                { id: 'm1', name: 'Manhour', value: 25000, frequency: 'yearly' }
+              ],
+              operationCosts: [
+                { id: 'o1', name: 'SHELL TURBO T46 (150 L/Day)', value: 6000000, frequency: 'yearly' }
+              ],
+              failureCosts: [],
+              safetyCosts: [],
+              demolishCost: 0,
+              salvageValue: 0
+            },
+            {
+              id: '2',
+              name: 'Option 2 Use PTT TERBIN T46',
+              description: 'Change to PTT TERBIN T46.',
+              initialCost: 0,
+              initialCosts: [],
+              maintenanceCosts: [
+                { id: 'm1', name: 'Manhour', value: 25000, frequency: 'yearly' }
+              ],
+              operationCosts: [
+                { id: 'o1', name: 'PTT TERBIN T46 (150 L/Day)', value: 3600000, frequency: 'yearly' }
+              ],
+              failureCosts: [],
+              safetyCosts: [],
+              demolishCost: 0,
+              salvageValue: 0
+            },
+            {
+              id: '3',
+              name: 'Option 3 Sent Sour to regen (Rayong)',
+              description: 'Transporting oil for regeneration in Rayong. (Environment not support)',
+              initialCost: 0,
+              initialCosts: [],
+              maintenanceCosts: [
+                { id: 'm1', name: 'Sent to regen (Rayong)', value: 1620000, frequency: 'yearly' },
+                { id: 'm2', name: 'Manhour', value: 25000, frequency: 'yearly' }
+              ],
+              operationCosts: [
+                { id: 'o1', name: 'Add new oil', value: 180000, frequency: 'yearly' }
+              ],
+              failureCosts: [],
+              safetyCosts: [],
+              demolishCost: 0,
+              salvageValue: 0
+            },
+            {
+              id: '4',
+              name: 'Option 4 Rent a Regenerative installed on-site.',
+              description: 'Rent a Regenerative braking system and have it installed on-site.',
+              initialCost: 100000,
+              initialCosts: [
+                { id: 'i1', name: 'Base Cost', value: 50000 },
+                { id: 'i2', name: 'Installation', value: 50000 }
+              ],
+              maintenanceCosts: [
+                { id: 'm1', name: 'Rent a Regenerative', value: 1700000, frequency: 'yearly' }
+              ],
+              operationCosts: [
+                { id: 'o1', name: 'N2', value: 73000, frequency: 'yearly' },
+                { id: 'o2', name: 'Electrical power', value: 120000, frequency: 'yearly' }
+              ],
+              failureCosts: [],
+              safetyCosts: [],
+              demolishCost: 0,
+              salvageValue: 0,
+              riskReduction: 90,
+              exposureFactor: 'Continuous'
+            },
+            {
+              id: '5',
+              name: 'Option 5 Overhaul K-1305',
+              description: 'Shutdown unit and overhaul K-1305',
+              initialCost: 1000000,
+              initialCosts: [
+                { id: 'i1', name: 'Base Cost', value: 500000 },
+                { id: 'i2', name: 'Installation', value: 500000 }
+              ],
+              maintenanceCosts: [],
+              operationCosts: [],
+              failureCosts: [
+                { id: 'f1', name: 'New Item', value: 2100000, frequency: 'yearly' }
+              ],
+              safetyCosts: [],
+              demolishCost: 0,
+              salvageValue: 0,
+              riskReduction: 100,
+              exposureFactor: 'Continuous'
+            }
+          ],
+          theme: 'light'
+        };
+        ProjectStorage.saveProject(id, projectData);
+        return id;
       }
     };
 
@@ -1672,6 +1789,12 @@
         }
       };
 
+      const handleLoadExample = () => {
+        const id = ProjectStorage.createExampleProject();
+        setProjects(ProjectStorage.getAllProjects());
+        onOpen(id);
+      };
+
       return (
         <div className="min-h-screen p-8 max-w-7xl mx-auto space-y-8">
           <div className="flex justify-between items-end">
@@ -1679,7 +1802,10 @@
               <h1 className="text-4xl font-black text-gray-900 dark:text-white">My Projects</h1>
               <p className="text-gray-500 dark:text-gray-400">Manage your LCC analyses</p>
             </div>
-            <Button size="lg" onClick={onCreate} className="shadow-xl shadow-indigo-500/20"><Icons.Plus className="h-5 w-5 mr-2" /> New Analysis</Button>
+            <div className="flex gap-3">
+              <Button size="lg" variant="secondary" onClick={handleLoadExample} className="bg-white text-indigo-600 border-indigo-200 hover:bg-indigo-50"><Icons.FileText className="h-5 w-5 mr-2" /> Load Example (K-1305)</Button>
+              <Button size="lg" onClick={onCreate} className="shadow-xl shadow-indigo-500/20"><Icons.Plus className="h-5 w-5 mr-2" /> New Analysis</Button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
